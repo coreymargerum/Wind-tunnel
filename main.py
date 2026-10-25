@@ -1,10 +1,10 @@
 import framebuf
 import time
 from machine import I2C, Pin
-from sh1107 import SH1107
 from sh1107 import SH1107_I2C
+from airspeed import MS4525DO
 
-i2c = I2C(0, sda=Pin(4), scl=Pin(5), freq=400000)
+i2c = I2C(1, sda=Pin(10), scl=Pin(11), freq=100000)
 oled = SH1107_I2C(
     128,
     128,
@@ -15,11 +15,13 @@ oled = SH1107_I2C(
     delay_ms=200
 )
 
-from machine import I2C, Pin
-
-i2c = I2C(0, sda=Pin(4), scl=Pin(5), freq=400000)
-
 print("I2C devices found:", [hex(addr) for addr in i2c.scan()])
+
+# Initialize Airspeed sensor
+airspeed_sensor = MS4525DO(i2c, address=0x28, p_min=-1.0, p_max=1.0)
+
+# ASP Calibrate zero offset with fans off
+airspeed_sensor.zero_calibrate()
 
 CELL_W, CELL_H = 42, 32
 items = [
@@ -38,10 +40,10 @@ target_rpms = [0] * 12
 actual_rpms = [0.0] * 12  # Tracks smoothly ramped real-time values
 
 # --- Hardware Pins ---
-pin_clk = Pin(7, Pin.IN, Pin.PULL_UP)
-pin_dt  = Pin(8, Pin.IN, Pin.PULL_UP)
-pin_sw  = Pin(9, Pin.IN, Pin.PULL_UP)
-btn     = Pin(14, Pin.IN, Pin.PULL_UP)
+pin_clk = Pin(16, Pin.IN, Pin.PULL_UP)
+pin_dt  = Pin(17, Pin.IN, Pin.PULL_UP)
+pin_sw  = Pin(18, Pin.IN, Pin.PULL_UP)
+btn     = Pin(21, Pin.IN, Pin.PULL_UP)
 
 # --- Global States ---
 selected_item = 0
@@ -189,7 +191,7 @@ def draw_menu_batt(Batt, drag, lift, Air_sp, REC):
 
     oled.text(f'Drag {drag}N', 0, 35, 1)
     oled.text(f'Lift {lift}N', 3, 50, 1)
-    oled.text(f'Air Speed {Air_sp}M/S', 3, 65, 1)
+    oled.text(f'Air {Air_sp:.1f}M/S', 3, 65, 1)
     oled.text(f'REC* Data:{REC}', 3, 100, 1)
     oled.show()
 
@@ -224,6 +226,36 @@ while True:
         needs_redraw = True
         time.sleep_ms(150)
     last_btn_state = btn.value()
+    
+    #Pressure sensor monitoring
+    pressure = airspeed_sensor.read_pressure_pa()
+    speed = airspeed_sensor.get_airspeed()
+    
+    if pressure is not None:
+        print(f"Pressure: {pressure:6.2f} Pa | Airspeed: {speed:5.2f} m/s")
+    else:
+        print("Sensor Read Error")
+        
+    time.sleep_ms(200)
+    
+    # 1. Update acceleration ramps
+    update_fan_ramps()
+
+    # If currently viewing telemetry (screen 2), update reading continuously
+    if screen == 2:
+        needs_redraw = True
+
+    # 4. Refresh OLED Display
+    if needs_redraw:
+        if screen == 1:
+            draw_menu_rpm()
+        else:
+            # Read real airspeed live from sensor
+            current_speed = airspeed_sensor.get_airspeed()
+            draw_menu_batt(3.3, 6.8, 1.4, current_speed, 'YES')
+        needs_redraw = False
+
+    time.sleep_ms(10)
 
     # 4. Refresh OLED Display
     if needs_redraw:
