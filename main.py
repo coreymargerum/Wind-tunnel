@@ -3,6 +3,7 @@ import time
 from machine import I2C, Pin
 from sh1107 import SH1107_I2C
 from airspeed import MS4525DO
+from hx711 import HX711
 
 i2c = I2C(1, sda=Pin(10), scl=Pin(11), freq=100000)
 oled = SH1107_I2C(
@@ -22,6 +23,24 @@ airspeed_sensor = MS4525DO(i2c, address=0x28, p_min=-1.0, p_max=1.0)
 
 # ASP Calibrate zero offset with fans off
 airspeed_sensor.zero_calibrate()
+
+LIFT_SCALE_FACTOR = 1047.39 
+DRAG_SCALE_FACTOR = 18019.17
+
+# Initialize Lift Sensor (1kg)
+lift_hx = HX711(d_out=12, pd_sck=13)
+lift_hx.tare(10)
+lift_hx.set_scale(LIFT_SCALE_FACTOR)
+
+# Initialize Drag Sensor (100g)
+drag_hx = HX711(d_out=14, pd_sck=15)
+drag_hx.tare(10)
+drag_hx.set_scale(DRAG_SCALE_FACTOR)
+
+btn_log  = Pin(19, Pin.IN, Pin.PULL_UP)  # Record Data (Reserved for next step)
+btn_tare = Pin(20, Pin.IN, Pin.PULL_UP)  # Tare Button
+btn_page = Pin(21, Pin.IN, Pin.PULL_UP)  # Page Toggle Button
+btn_estop= Pin(22, Pin.IN, Pin.PULL_UP)  # Emergency Stop Button
 
 CELL_W, CELL_H = 42, 32
 items = [
@@ -50,6 +69,16 @@ selected_item = 0
 is_editing = False      # False = Browsing, True = Editing
 screen = 1
 needs_redraw = True
+logging_active = False
+
+last_sw_state    = 1
+last_page_state  = 1
+last_tare_state  = 1
+last_estop_state = 1
+last_log_state   = 1
+
+target_rpms = [0] * 12
+actual_rpms = [0.0] * 12
 
 last_clk = pin_clk.value()
 last_ramp_time = time.ticks_ms()
@@ -201,68 +230,76 @@ draw_menu_rpm()
 last_sw_state = 1
 last_btn_state = 1
 
+# --- Functions for New Buttons ---
+def trigger_tare():
+    """Zeroes load cells and pitot sensor."""
+    global needs_redraw
+    lift_hx.tare(10)
+    drag_hx.tare(10)
+    airspeed_sensor.zero_calibrate(10)
+    needs_redraw = True
+    print("Tare Complete")
+
+def trigger_emergency_stop():
+    """Immediately sets all fan target and actual speeds to 0%."""
+    global needs_redraw
+    for i in range(12):
+        target_rpms[i] = 0
+        actual_rpms[i] = 0.0
+    needs_redraw = True
+    print("EMERGENCY STOP TRIGGERED: All motors cut to 0%")
+    
 # --- Main Program Loop ---
 while True:
-    # 1. Update acceleration ramps
+    # 1. Update motor acceleration ramps
     update_fan_ramps()
 
-    # 2. Polling for Encoder Switch (GP9)
+    # 2. Emergency Stop Button (GP22)
+    estop_val = btn_estop.value()
+    if last_estop_state == 1 and estop_val == 0:
+        trigger_emergency_stop()
+        time.sleep_ms(150)
+    last_estop_state = estop_val
+
+    # 3. Tare Button (GP20)
+    tare_val = btn_tare.value()
+    if last_tare_state == 1 and tare_val == 0:
+        trigger_tare()
+        time.sleep_ms(200)
+    last_tare_state = tare_val
+
+    # 4. Page Toggle Button (GP21)
+    page_val = btn_page.value()
+    if last_page_state == 1 and page_val == 0:
+        screen = 2 if screen == 1 else 1
+        is_editing = False
+        needs_redraw = True
+        time.sleep_ms(150)
+    last_page_state = page_val
+
+    # 5. Rotary Encoder Switch (GP18)
     sw_val = pin_sw.value()
     if last_sw_state == 1 and sw_val == 0:
         if screen == 1:
             is_editing = not is_editing
             needs_redraw = True
         time.sleep_ms(150)
-    last_sw_state = pin_sw.value()
+    last_sw_state = sw_val
 
-    # 3. Polling for Screen Toggle Button (GP14)
-    btn_val = btn.value()
-    if last_btn_state == 1 and btn_val == 0:
-        if screen == 1:
-            screen = 2
-            is_editing = False
-        else:
-            screen = 1
-        needs_redraw = True
-        time.sleep_ms(150)
-    last_btn_state = btn.value()
-    
-    #Pressure sensor monitoring
-    pressure = airspeed_sensor.read_pressure_pa()
-    speed = airspeed_sensor.get_airspeed()
-    
-    if pressure is not None:
-        print(f"Pressure: {pressure:6.2f} Pa | Airspeed: {speed:5.2f} m/s")
-    else:
-        print("Sensor Read Error")
-        
-    time.sleep_ms(200)
-    
-    # 1. Update acceleration ramps
-    update_fan_ramps()
-
-    # If currently viewing telemetry (screen 2), update reading continuously
+    # 6. Refresh OLED Display
     if screen == 2:
-        needs_redraw = True
+        needs_redraw = True  # Keep updating telemetry continuously
 
-    # 4. Refresh OLED Display
     if needs_redraw:
         if screen == 1:
             draw_menu_rpm()
         else:
-            # Read real airspeed live from sensor
-            current_speed = airspeed_sensor.get_airspeed()
-            draw_menu_batt(3.3, 6.8, 1.4, current_speed, 'YES')
+            # Read real values live
+            lift_n = round(((lift_hx.get_units(1)) / 1000.0) * 9.81, 2)
+            drag_n = round(((drag_hx.get_units(1)) / 1000.0) * 9.81, 2)
+            speed_ms = round(airspeed_sensor.get_airspeed(), 1)
+            
+            draw_menu_batt(3.3, drag_n, lift_n, speed_ms, 'NO')
         needs_redraw = False
-
-    time.sleep_ms(10)
-
-    # 4. Refresh OLED Display
-    if needs_redraw:
-        if screen == 1:
-            draw_menu_rpm()
-        else:
-            draw_menu_batt(3.3, 6.8, 1.4, 12, 'YES')
-        needs_redraw = False
-
+    
     time.sleep_ms(10)
